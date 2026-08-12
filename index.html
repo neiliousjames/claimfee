@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ASTROD — claim creator fees</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#0b0f1a; color:#e8e8ec; font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; display:flex; min-height:100vh; align-items:center; justify-content:center; padding:20px; }
+  .card { width:100%; max-width:520px; background:#0f1420; border:1px solid rgba(255,255,255,.1); border-radius:18px; padding:26px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:#9aa0ad; font-size:13px; margin-bottom:20px; }
+  .row { display:flex; justify-content:space-between; gap:10px; padding:9px 0; border-top:1px solid rgba(255,255,255,.07); font-size:13px; }
+  .row b { color:#fff; }
+  button { width:100%; border:none; border-radius:12px; padding:14px; font:600 14px ui-monospace,monospace; cursor:pointer; margin-top:14px; }
+  .primary { background:#c6f10a; color:#0b0f1a; }
+  .primary:disabled { opacity:.45; cursor:not-allowed; }
+  .ghost { background:transparent; border:1px solid rgba(255,255,255,.15); color:#e8e8ec; }
+  .log { margin-top:16px; font-size:12.5px; white-space:pre-wrap; word-break:break-word; background:#0b0f1a; border:1px solid rgba(255,255,255,.08); border-radius:10px; padding:12px; min-height:54px; color:#c8ccd4; }
+  .ok { color:#4ade80; } .err { color:#f87171; } .warn { color:#fbbf24; }
+  a { color:#8ab4ff; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Claim $ASTROD creator fees</h1>
+    <div class="sub">Robinhood Chain · connect the creator wallet and claim.</div>
+
+    <div class="row"><span>Coin</span><b id="coin">0x8363…7b9B</b></div>
+    <div class="row"><span>Creator wallet</span><b>0xFe02…caf6</b></div>
+    <div class="row"><span>Wallet</span><b id="acct">not connected</b></div>
+    <div class="row"><span>Locker holding it</span><b id="locker">—</b></div>
+
+    <button class="primary" id="connect">Connect wallet</button>
+    <button class="primary" id="claim" disabled>Claim fees</button>
+    <button class="ghost" id="recheck" style="display:none">Re-check lockers</button>
+
+    <div class="log" id="log">Click “Connect wallet”. MetaMask will switch to Robinhood Chain, then this page auto-detects which locker holds your coin.</div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.2/ethers.umd.min.js"></script>
+  <script>
+    const COIN = "0x8363b867548797f8cc217C97FE64cE8fB44a7b9B";
+    const LOCKERS = [
+      { name: "Active",  addr: "0x736D76699C26D0d966744cAe304C000d471f7F35" },
+      { name: "Legacy",  addr: "0x31ca5E101941A93A7DD6d0497928700625CF54B5" },
+    ];
+    const CHAIN_ID = 4663, CHAIN_HEX = "0x1237";
+    const RPC = "https://rpc.mainnet.chain.robinhood.com";
+    const EXPLORER = "https://robinhoodchain.blockscout.com";
+    const ABI = ["function collectFees(address token) returns (uint256 amount0, uint256 amount1)"];
+
+    const $ = (id) => document.getElementById(id);
+    const log = (m, cls="") => { $("log").innerHTML = cls ? `<span class="${cls}">${m}</span>` : m; };
+    let signer, chosen = null;
+
+    async function ensureChain() {
+      try { await window.ethereum.request({ method:"wallet_switchEthereumChain", params:[{ chainId: CHAIN_HEX }] }); }
+      catch (e) {
+        if (e.code === 4902) {
+          await window.ethereum.request({ method:"wallet_addEthereumChain", params:[{
+            chainId: CHAIN_HEX, chainName:"Robinhood Chain",
+            nativeCurrency:{ name:"ETH", symbol:"ETH", decimals:18 },
+            rpcUrls:[RPC], blockExplorerUrls:[EXPLORER],
+          }]});
+        } else throw e;
+      }
+    }
+
+    async function detect() {
+      chosen = null; $("claim").disabled = true;
+      log("Checking which locker holds your coin…", "warn");
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      for (const L of LOCKERS) {
+        try {
+          const c = new ethers.Contract(L.addr, ABI, provider);
+          const res = await c.collectFees.staticCall(COIN, { from: await signer.getAddress() });
+          // no revert -> this locker holds it
+          chosen = L;
+          $("locker").textContent = L.name + " ✓";
+          $("claim").disabled = false;
+          const a0 = res[0] ?? res.amount0, a1 = res[1] ?? res.amount1;
+          log(`Found in ${L.name} locker.\nClaimable (simulated): amount0=${a0}, amount1=${a1}.\nClick “Claim fees”.`, "ok");
+          return;
+        } catch (e) {
+          // TokenNotFound() or other -> try next
+        }
+      }
+      $("locker").textContent = "not found";
+      log("Coin not found in either known locker. It may be in a different contract — send me a screenshot of the coin's launch transaction.", "err");
+    }
+
+    $("connect").onclick = async () => {
+      if (!window.ethereum) { log("No wallet found. Open this in a browser with MetaMask.", "err"); return; }
+      try {
+        await window.ethereum.request({ method:"eth_requestAccounts" });
+        await ensureChain();
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        signer = await provider.getSigner();
+        const addr = await signer.getAddress();
+        $("acct").textContent = addr.slice(0,6) + "…" + addr.slice(-4);
+        $("connect").style.display = "none";
+        $("recheck").style.display = "block";
+        await detect();
+      } catch (e) { log(e.message || String(e), "err"); }
+    };
+
+    $("recheck").onclick = detect;
+
+    $("claim").onclick = async () => {
+      if (!chosen) return;
+      try {
+        $("claim").disabled = true;
+        log(`Sending claim on ${chosen.name} locker… confirm in your wallet.`, "warn");
+        const c = new ethers.Contract(chosen.addr, ABI, signer);
+        const tx = await c.collectFees(COIN);
+        log(`Submitted: ${tx.hash}\nWaiting for confirmation…`, "warn");
+        const rc = await tx.wait();
+        log(`Done! Fees claimed to your wallet.\nTx: ${EXPLORER}/tx/${rc.hash}`, "ok");
+      } catch (e) {
+        $("claim").disabled = false;
+        log("Claim failed: " + (e.shortMessage || e.message || String(e)), "err");
+      }
+    };
+  </script>
+</body>
+</html>
