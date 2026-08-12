@@ -8,11 +8,11 @@
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin:0; background:#0b0f1a; color:#e8e8ec; font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; display:flex; min-height:100vh; align-items:center; justify-content:center; padding:20px; }
-  .card { width:100%; max-width:520px; background:#0f1420; border:1px solid rgba(255,255,255,.1); border-radius:18px; padding:26px; }
+  .card { width:100%; max-width:560px; background:#0f1420; border:1px solid rgba(255,255,255,.1); border-radius:18px; padding:26px; }
   h1 { font-size:20px; margin:0 0 4px; }
   .sub { color:#9aa0ad; font-size:13px; margin-bottom:20px; }
   .row { display:flex; justify-content:space-between; gap:10px; padding:9px 0; border-top:1px solid rgba(255,255,255,.07); font-size:13px; }
-  .row b { color:#fff; }
+  .row b { color:#fff; text-align:right; }
   button { width:100%; border:none; border-radius:12px; padding:14px; font:600 14px ui-monospace,monospace; cursor:pointer; margin-top:14px; }
   .primary { background:#c6f10a; color:#0b0f1a; }
   .primary:disabled { opacity:.45; cursor:not-allowed; }
@@ -25,99 +25,116 @@
 <body>
   <div class="card">
     <h1>Claim $ASTROD creator fees</h1>
-    <div class="sub">Robinhood Chain · connect the creator wallet and claim.</div>
+    <div class="sub">Robinhood Chain · connect the creator wallet, this finds the claim call for you.</div>
 
-    <div class="row"><span>Coin</span><b id="coin">0x8363…7b9B</b></div>
-    <div class="row"><span>Creator wallet</span><b>0xFe02…caf6</b></div>
+    <div class="row"><span>Coin</span><b>0x8363…7b9B</b></div>
+    <div class="row"><span>Creator</span><b>0xFe02…caf6</b></div>
     <div class="row"><span>Wallet</span><b id="acct">not connected</b></div>
-    <div class="row"><span>Locker holding it</span><b id="locker">—</b></div>
+    <div class="row"><span>Found</span><b id="found">—</b></div>
 
     <button class="primary" id="connect">Connect wallet</button>
     <button class="primary" id="claim" disabled>Claim fees</button>
-    <button class="ghost" id="recheck" style="display:none">Re-check lockers</button>
+    <button class="ghost" id="recheck" style="display:none">Re-scan</button>
 
-    <div class="log" id="log">Click “Connect wallet”. MetaMask will switch to Robinhood Chain, then this page auto-detects which locker holds your coin.</div>
+    <div class="log" id="log">Click “Connect wallet”. It switches to Robinhood Chain, then scans the coin + related contracts for the working claim function.</div>
   </div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.2/ethers.umd.min.js"></script>
   <script>
     const COIN = "0x8363b867548797f8cc217C97FE64cE8fB44a7b9B";
-    const LOCKERS = [
-      { name: "Active",  addr: "0x736D76699C26D0d966744cAe304C000d471f7F35" },
-      { name: "Legacy",  addr: "0x31ca5E101941A93A7DD6d0497928700625CF54B5" },
+    // Candidate contracts that might hold the position / expose the claim.
+    const TARGETS = [
+      { name: "coin (self)", addr: COIN },
+      { name: "V2-a",        addr: "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e" },
+      { name: "V2-b",        addr: "0x29ca4540b4c0007e5195c51178928a74d45fdb13" },
+      { name: "Active lock", addr: "0x736D76699C26D0d966744cAe304C000d471f7F35" },
+      { name: "Legacy lock", addr: "0x31ca5E101941A93A7DD6d0497928700625CF54B5" },
     ];
-    const CHAIN_ID = 4663, CHAIN_HEX = "0x1237";
+    // Function signatures to try. useCoin=true appends the coin address as arg.
+    const FNS = [
+      { sig:"collectFees(address)", useCoin:true },
+      { sig:"claimFees(address)",   useCoin:true },
+      { sig:"collect(address)",     useCoin:true },
+      { sig:"claim(address)",       useCoin:true },
+      { sig:"collectCreatorFees(address)", useCoin:true },
+      { sig:"collectFees()",        useCoin:false },
+      { sig:"claimFees()",          useCoin:false },
+      { sig:"claim()",              useCoin:false },
+      { sig:"collect()",            useCoin:false },
+      { sig:"collectCreatorFees()", useCoin:false },
+      { sig:"claimCreatorFees()",   useCoin:false },
+    ];
+    const CHAIN_HEX = "0x1237";
     const RPC = "https://rpc.mainnet.chain.robinhood.com";
     const EXPLORER = "https://robinhoodchain.blockscout.com";
-    const ABI = ["function collectFees(address token) returns (uint256 amount0, uint256 amount1)"];
 
     const $ = (id) => document.getElementById(id);
     const log = (m, cls="") => { $("log").innerHTML = cls ? `<span class="${cls}">${m}</span>` : m; };
-    let signer, chosen = null;
+    let signer, me, hit = null;
+
+    function calldata(fn) {
+      const sel = ethers.id(fn.sig).slice(0, 10);
+      return fn.useCoin ? sel + "000000000000000000000000" + COIN.slice(2).toLowerCase() : sel;
+    }
 
     async function ensureChain() {
       try { await window.ethereum.request({ method:"wallet_switchEthereumChain", params:[{ chainId: CHAIN_HEX }] }); }
       catch (e) {
-        if (e.code === 4902) {
-          await window.ethereum.request({ method:"wallet_addEthereumChain", params:[{
-            chainId: CHAIN_HEX, chainName:"Robinhood Chain",
-            nativeCurrency:{ name:"ETH", symbol:"ETH", decimals:18 },
-            rpcUrls:[RPC], blockExplorerUrls:[EXPLORER],
-          }]});
-        } else throw e;
+        if (e.code === 4902) await window.ethereum.request({ method:"wallet_addEthereumChain", params:[{
+          chainId: CHAIN_HEX, chainName:"Robinhood Chain",
+          nativeCurrency:{ name:"ETH", symbol:"ETH", decimals:18 }, rpcUrls:[RPC], blockExplorerUrls:[EXPLORER] }]});
+        else throw e;
       }
     }
 
-    async function detect() {
-      chosen = null; $("claim").disabled = true;
-      log("Checking which locker holds your coin…", "warn");
+    async function scan() {
+      hit = null; $("claim").disabled = true; $("found").textContent = "scanning…";
       const provider = new ethers.BrowserProvider(window.ethereum);
-      for (const L of LOCKERS) {
-        try {
-          const c = new ethers.Contract(L.addr, ABI, provider);
-          const res = await c.collectFees.staticCall(COIN, { from: await signer.getAddress() });
-          // no revert -> this locker holds it
-          chosen = L;
-          $("locker").textContent = L.name + " ✓";
-          $("claim").disabled = false;
-          const a0 = res[0] ?? res.amount0, a1 = res[1] ?? res.amount1;
-          log(`Found in ${L.name} locker.\nClaimable (simulated): amount0=${a0}, amount1=${a1}.\nClick “Claim fees”.`, "ok");
-          return;
-        } catch (e) {
-          // TokenNotFound() or other -> try next
+      for (const t of TARGETS) {
+        const code = await provider.getCode(t.addr);
+        if (!code || code === "0x") continue; // no contract here
+        for (const fn of FNS) {
+          const data = calldata(fn);
+          try {
+            await provider.call({ to: t.addr, data, from: me }); // reverts if not callable
+            hit = { target: t, fn, data };
+            $("found").textContent = `${t.name} · ${fn.sig}`;
+            $("claim").disabled = false;
+            log(`Found a working claim:\n  contract: ${t.name} (${t.addr})\n  function: ${fn.sig}\nClick “Claim fees” to send it.`, "ok");
+            return;
+          } catch (_) { /* try next */ }
         }
       }
-      $("locker").textContent = "not found";
-      log("Coin not found in either known locker. It may be in a different contract — send me a screenshot of the coin's launch transaction.", "err");
+      $("found").textContent = "nothing";
+      log("No working claim function found on the known contracts. Screenshot the coin's “Read/Write contract” → Write tab so I can see the exact function name.", "err");
     }
 
     $("connect").onclick = async () => {
-      if (!window.ethereum) { log("No wallet found. Open this in a browser with MetaMask.", "err"); return; }
+      if (!window.ethereum) { log("No wallet found. Open this file in Chrome with MetaMask (enable “Allow access to file URLs” for MetaMask if needed).", "err"); return; }
       try {
         await window.ethereum.request({ method:"eth_requestAccounts" });
         await ensureChain();
         const provider = new ethers.BrowserProvider(window.ethereum);
         signer = await provider.getSigner();
-        const addr = await signer.getAddress();
-        $("acct").textContent = addr.slice(0,6) + "…" + addr.slice(-4);
+        me = await signer.getAddress();
+        $("acct").textContent = me.slice(0,6) + "…" + me.slice(-4);
         $("connect").style.display = "none";
         $("recheck").style.display = "block";
-        await detect();
+        log("Scanning contracts + functions…", "warn");
+        await scan();
       } catch (e) { log(e.message || String(e), "err"); }
     };
-
-    $("recheck").onclick = detect;
+    $("recheck").onclick = scan;
 
     $("claim").onclick = async () => {
-      if (!chosen) return;
+      if (!hit) return;
       try {
         $("claim").disabled = true;
-        log(`Sending claim on ${chosen.name} locker… confirm in your wallet.`, "warn");
-        const c = new ethers.Contract(chosen.addr, ABI, signer);
-        const tx = await c.collectFees(COIN);
-        log(`Submitted: ${tx.hash}\nWaiting for confirmation…`, "warn");
+        log(`Sending ${hit.fn.sig} on ${hit.target.name}… confirm in your wallet.`, "warn");
+        const tx = await signer.sendTransaction({ to: hit.target.addr, data: hit.data });
+        log(`Submitted: ${tx.hash}\nWaiting…`, "warn");
         const rc = await tx.wait();
-        log(`Done! Fees claimed to your wallet.\nTx: ${EXPLORER}/tx/${rc.hash}`, "ok");
+        log(`Done! Fees claimed.\nTx: ${EXPLORER}/tx/${rc.hash}`, "ok");
       } catch (e) {
         $("claim").disabled = false;
         log("Claim failed: " + (e.shortMessage || e.message || String(e)), "err");
